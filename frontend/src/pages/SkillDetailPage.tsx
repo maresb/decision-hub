@@ -30,20 +30,22 @@ import {
   getSkill,
   getEvalReport,
   getAuditLog,
+  getScanReport,
   downloadSkillZip,
   getSimilarSkills,
 } from "../api/client";
 import { useApi } from "../hooks/useApi";
 import { useSEO } from "../hooks/useSEO";
 import { useRecentlyViewed } from "../hooks/useRecentlyViewed";
-import type { SkillSummary, EvalReport, AuditLogEntry, CheckResult, PaginatedAuditLogResponse, SkillFile, SimilarSkillRef } from "../types/api";
+import type { SkillSummary, EvalReport, AuditLogEntry, CheckResult, PaginatedAuditLogResponse, ScanReport, SkillFile, SimilarSkillRef } from "../types/api";
 import NeonCard from "../components/NeonCard";
 import GradeBadge from "../components/GradeBadge";
 import LoadingSpinner from "../components/LoadingSpinner";
 import EvalReportView from "../components/EvalReportView";
 import FileBrowser from "../components/FileBrowser";
+import ScannerReport from "../components/ScannerReport";
 import { formatCheckName } from "./auditUtils";
-import { LINK_TO_MANIFEST } from "../featureFlags";
+import { LINK_TO_MANIFEST, SHOW_SCANNER_REPORT } from "../featureFlags";
 import styles from "./SkillDetailPage.module.css";
 
 const REMARK_PLUGINS: PluggableList = [remarkGfm];
@@ -121,6 +123,15 @@ export default function SkillDetailPage() {
     [orgSlug, skillName]
   );
   const auditLog = auditLogResponse?.items ?? [];
+
+  // Fetch Cisco scanner report (behind feature flag)
+  const { data: scanReport } = useApi<ScanReport | null>(
+    () =>
+      SHOW_SCANNER_REPORT && orgSlug && skillName
+        ? getScanReport(orgSlug, skillName)
+        : Promise.resolve(null),
+    [orgSlug, skillName]
+  );
 
   const { data: similarSkills, error: similarError } = useApi<SimilarSkillRef[]>(
     () =>
@@ -303,7 +314,7 @@ export default function SkillDetailPage() {
               <EvalsTab report={evalReport} loading={evalLoading} />
             )}
             {activeTab === "audit" && (
-              <AuditTab entries={auditLog ?? []} loading={auditLoading} />
+              <AuditTab entries={auditLog ?? []} loading={auditLoading} scanReport={scanReport ?? undefined} />
             )}
           </div>
         </div>
@@ -622,12 +633,14 @@ export function CheckResultsGrid({ checks }: { checks: CheckResult[] }) {
 function AuditTab({
   entries,
   loading,
+  scanReport,
 }: {
   entries: AuditLogEntry[];
   loading: boolean;
+  scanReport?: ScanReport;
 }) {
   if (loading) return <LoadingSpinner text="Loading audit log..." />;
-  if (entries.length === 0) {
+  if (entries.length === 0 && !scanReport) {
     return (
       <div className={styles.emptyTab}>
         <Shield size={48} />
@@ -638,7 +651,7 @@ function AuditTab({
 
   return (
     <div className={styles.auditList}>
-      {entries.map((entry) => (
+      {entries.map((entry, idx) => (
         <NeonCard
           key={entry.id}
           glow={entry.grade === "F" ? "pink" : entry.grade === "A" ? "green" : "cyan"}
@@ -667,6 +680,10 @@ function AuditTab({
               <span className={styles.auditQuarantine}>
                 Quarantined: {entry.quarantine_s3_key}
               </span>
+            )}
+
+            {idx === 0 && scanReport && (
+              <ScannerReport report={scanReport} />
             )}
           </div>
         </NeonCard>
