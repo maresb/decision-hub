@@ -442,7 +442,7 @@ scan_findings_table = Table(
     Column("is_false_positive", Boolean, nullable=True),
     Column("meta_confidence", Text, nullable=True),
     Column("meta_priority", Integer, nullable=True),
-    Column("metadata_", JSONB, nullable=False, server_default="{}"),
+    Column("metadata", JSONB, nullable=False, server_default="{}", key="metadata_"),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
 )
 

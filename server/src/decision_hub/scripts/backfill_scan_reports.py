@@ -111,7 +111,12 @@ def main() -> None:
 
     settings = create_settings()
     engine = create_engine(settings.database_url)
-    s3_client = create_s3_client(settings)
+    s3_client = create_s3_client(
+        region=settings.aws_region,
+        access_key_id=settings.aws_access_key_id,
+        secret_access_key=settings.aws_secret_access_key,
+        endpoint_url=settings.s3_endpoint_url,
+    )
 
     logger.info("Finding skills needing scan reports...")
     skills = _find_skills_needing_scan(engine, limit=args.limit)
