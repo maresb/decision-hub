@@ -323,8 +323,95 @@ export default function SkillDetailPage() {
         <aside className={styles.sidebar}>
           <NeonCard glow={skill.safety_rating === "A" ? "green" : skill.safety_rating === "F" ? "pink" : "cyan"}>
             <div className={styles.sidebarGrade}>
-              <GradeBadge grade={skill.safety_rating} size="lg" />
-              <span className={styles.sidebarGradeLabel}>Safety Grade</span>
+              <button
+                className={styles.gradeColumn}
+                onClick={() => {
+                  setActiveTab("audit");
+                  setTimeout(() => {
+                    const el = document.querySelector(`[id^="gauntlet-"]`);
+                    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  }, 100);
+                }}
+              >
+                <span className={styles.sidebarGradeLabel}>Safety Grade</span>
+                <GradeBadge grade={skill.safety_rating} size="lg" />
+              </button>
+              {scanReport && (
+                <button
+                  className={styles.scanColumn}
+                  onClick={() => {
+                    setActiveTab("audit");
+                    setTimeout(() => {
+                      document.getElementById("scanner-report")
+                        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                    }, 100);
+                  }}
+                >
+                  <span className={styles.sidebarGradeLabel}>Cisco Scan</span>
+                  {scanReport.meta_risk_level && (
+                    <span className={styles.scanLabeledBadge}>
+                      <span className={styles.scanLabel}>risk</span>
+                      <span
+                        className={styles.scanBadge}
+                        style={{
+                          borderColor:
+                            scanReport.meta_risk_level === "CRITICAL" ? "#ff4757"
+                            : scanReport.meta_risk_level === "HIGH" ? "#ff6b35"
+                            : scanReport.meta_risk_level === "MEDIUM" ? "#ffa502"
+                            : scanReport.meta_risk_level === "LOW" ? "#3742fa"
+                            : "#2ed573",
+                          color:
+                            scanReport.meta_risk_level === "CRITICAL" ? "#ff4757"
+                            : scanReport.meta_risk_level === "HIGH" ? "#ff6b35"
+                            : scanReport.meta_risk_level === "MEDIUM" ? "#ffa502"
+                            : scanReport.meta_risk_level === "LOW" ? "#3742fa"
+                            : "#2ed573",
+                        }}
+                      >
+                        {scanReport.meta_risk_level}
+                      </span>
+                    </span>
+                  )}
+                  <span className={styles.scanLabeledBadge}>
+                    <span className={styles.scanLabel}>severity</span>
+                    <span
+                      className={styles.scanBadge}
+                      style={{
+                        borderColor:
+                          scanReport.max_severity === "CRITICAL" ? "#ff4757"
+                          : scanReport.max_severity === "HIGH" ? "#ff6b35"
+                          : scanReport.max_severity === "MEDIUM" ? "#ffa502"
+                          : scanReport.max_severity === "LOW" ? "#3742fa"
+                          : "#2ed573",
+                        color:
+                          scanReport.max_severity === "CRITICAL" ? "#ff4757"
+                          : scanReport.max_severity === "HIGH" ? "#ff6b35"
+                          : scanReport.max_severity === "MEDIUM" ? "#ffa502"
+                          : scanReport.max_severity === "LOW" ? "#3742fa"
+                          : "#2ed573",
+                      }}
+                    >
+                      {scanReport.max_severity}
+                    </span>
+                  </span>
+                  {scanReport.meta_verdict && (
+                    <span className={styles.scanLabeledBadge}>
+                      <span className={styles.scanLabel}>verdict</span>
+                      <span
+                        className={styles.scanVerdictBadge}
+                        style={{
+                          backgroundColor:
+                            scanReport.meta_verdict === "MALICIOUS" ? "#ff4757"
+                            : scanReport.meta_verdict === "SUSPICIOUS" ? "#ffa502"
+                            : "#2ed573",
+                        }}
+                      >
+                        {scanReport.meta_verdict}
+                      </span>
+                    </span>
+                  )}
+                </button>
+              )}
             </div>
             <div className={styles.sidebarActions}>
               <button onClick={handleCopyInstall} className={styles.installBtn}>
@@ -651,12 +738,23 @@ function AuditTab({
 
   return (
     <div className={styles.auditList}>
-      {entries.map((entry, idx) => (
+      {scanReport && (
+        <div id="scanner-report">
+          <NeonCard glow={
+            scanReport.meta_verdict === "MALICIOUS" ? "pink"
+            : scanReport.meta_verdict === "SUSPICIOUS" ? "cyan"
+            : "green"
+          }>
+            <ScannerReport report={scanReport} />
+          </NeonCard>
+        </div>
+      )}
+      {entries.map((entry) => (
         <NeonCard
           key={entry.id}
           glow={entry.grade === "F" ? "pink" : entry.grade === "A" ? "green" : "cyan"}
         >
-          <div className={styles.auditEntry}>
+          <div className={styles.auditEntry} id={`gauntlet-${entry.id}`}>
             <div className={styles.auditHeader}>
               <div className={styles.auditInfo}>
                 <GradeBadge grade={entry.grade} size="sm" />
@@ -680,10 +778,6 @@ function AuditTab({
               <span className={styles.auditQuarantine}>
                 Quarantined: {entry.quarantine_s3_key}
               </span>
-            )}
-
-            {idx === 0 && scanReport && (
-              <ScannerReport report={scanReport} />
             )}
           </div>
         </NeonCard>

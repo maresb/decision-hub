@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, Shield, AlertTriangle, Info, Code, ExternalLink } from "lucide-react";
+import { ChevronDown, ChevronRight, AlertTriangle, Info, Code, ExternalLink } from "lucide-react";
 import type { ScanReport, ScanFinding } from "../types/api";
 import styles from "./ScannerReport.module.css";
 
@@ -126,36 +126,41 @@ export default function ScannerReport({ report }: { report: ScanReport }) {
     return indices.length === 0 || !indices.every((i) => fpByOriginalIndex.get(i));
   });
 
+  const scanDate = report.created_at
+    ? new Date(report.created_at).toLocaleDateString()
+    : null;
+
   return (
     <div className={styles.scannerReport}>
       <div className={styles.reportHeader}>
-        <Shield size={16} />
-        <a
-          href={SCANNER_REPO}
-          target="_blank"
-          rel="noopener noreferrer"
-          className={styles.reportTitleLink}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <span className={styles.reportTitle}>Cisco Skill Scanner Report</span>
-          <ExternalLink size={11} />
-        </a>
+        <div className={styles.reportHeaderInfo}>
+          {report.meta_risk_level && (
+            <LabeledBadge
+              label="risk"
+              value={report.meta_risk_level}
+              color={SEVERITY_COLORS[report.meta_risk_level] || "#747d8c"}
+            />
+          )}
+          <a
+            href={SCANNER_REPO}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={styles.reportTitleLink}
+            onClick={(e) => e.stopPropagation()}
+          >
+            Cisco Skill Scanner
+            <ExternalLink size={11} />
+          </a>
+        </div>
+        {scanDate && <span className={styles.reportDate}>{scanDate}</span>}
       </div>
 
       <div className={styles.summaryBar}>
-        {report.meta_risk_level ? (
-          <LabeledBadge
-            label="risk"
-            value={report.meta_risk_level}
-            color={SEVERITY_COLORS[report.meta_risk_level] || "#747d8c"}
-          />
-        ) : (
-          <LabeledBadge
-            label="severity"
-            value={report.max_severity}
-            color={SEVERITY_COLORS[report.max_severity] || "#747d8c"}
-          />
-        )}
+        <LabeledBadge
+          label="severity"
+          value={report.max_severity}
+          color={SEVERITY_COLORS[report.max_severity] || "#747d8c"}
+        />
         {report.meta_verdict && (
           <VerdictBadge verdict={report.meta_verdict} />
         )}
