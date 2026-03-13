@@ -3261,6 +3261,11 @@ def list_tracker_metrics(conn: Connection, *, limit: int = 50) -> list[TrackerMe
 
 def _row_to_scan_report(row: Any) -> ScanReport:
     m = row._mapping
+    meta_analysis = m.get("meta_analysis") or {}
+    risk_assessment = meta_analysis.get("overall_risk_assessment") if isinstance(meta_analysis, dict) else None
+    scan_meta = m.get("scan_metadata") or {}
+    if not isinstance(scan_meta, dict):
+        scan_meta = {}
     return ScanReport(
         id=m["id"],
         version_id=m["version_id"],
@@ -3277,17 +3282,24 @@ def _row_to_scan_report(row: Any) -> ScanReport:
         meta_risk_level=m.get("meta_risk_level"),
         meta_summary=m.get("meta_summary"),
         meta_top_priority=m.get("meta_top_priority"),
+        meta_verdict_reasoning=risk_assessment.get("verdict_reasoning") if risk_assessment else None,
+        meta_correlations=m.get("meta_correlations"),
+        meta_recommendations=m.get("meta_recommendations"),
         meta_false_positive_count=m.get("meta_false_positive_count"),
+        llm_overall_assessment=scan_meta.get("llm_overall_assessment"),
+        llm_primary_threats=scan_meta.get("llm_primary_threats"),
         scanner_version=m.get("scanner_version"),
         scanner_model=m.get("scanner_model"),
         policy_name=m.get("policy_name"),
         scan_duration_ms=m.get("scan_duration_ms"),
+        full_report=m.get("full_report"),
         created_at=m.get("created_at"),
     )
 
 
 def _row_to_scan_finding(row: Any) -> ScanFinding:
     m = row._mapping
+    meta = m.get("metadata_") or {}
     return ScanFinding(
         id=m["id"],
         report_id=m["report_id"],
@@ -3304,7 +3316,10 @@ def _row_to_scan_finding(row: Any) -> ScanFinding:
         is_false_positive=m.get("is_false_positive"),
         meta_confidence=m.get("meta_confidence"),
         meta_priority=m.get("meta_priority"),
-        metadata=m.get("metadata_") or {},
+        meta_impact=meta.get("meta_impact"),
+        meta_exploitability=meta.get("meta_exploitability"),
+        meta_confidence_reason=meta.get("meta_confidence_reason"),
+        metadata=meta,
     )
 
 
@@ -3393,9 +3408,9 @@ def insert_scan_findings(conn: Connection, report_id: UUID, findings: list[dict]
             "is_false_positive": f.get("is_false_positive"),
             "meta_confidence": f.get("meta_confidence"),
             "meta_priority": f.get("meta_priority"),
-            "metadata_": f.get("metadata", {}),
+            "metadata_": {**f.get("metadata", {}), "scanner_index": i},
         }
-        for f in findings
+        for i, f in enumerate(findings)
     ]
     conn.execute(sa.insert(scan_findings_table), rows)
     return len(rows)
@@ -3414,21 +3429,15 @@ def find_scan_report_for_version(conn: Connection, version_id: UUID) -> ScanRepo
 
 
 def find_scan_findings_for_report(conn: Connection, report_id: UUID) -> list[ScanFinding]:
-    """Return all findings for a scan report, ordered by severity then priority."""
-    severity_order = sa.case(
-        (scan_findings_table.c.severity == "CRITICAL", 0),
-        (scan_findings_table.c.severity == "HIGH", 1),
-        (scan_findings_table.c.severity == "MEDIUM", 2),
-        (scan_findings_table.c.severity == "LOW", 3),
-        (scan_findings_table.c.severity == "INFO", 4),
-        else_=5,
-    )
+    """Return findings in scanner order so finding_indices in meta_correlations
+    map correctly. Display sorting happens in the frontend."""
+    scanner_index = scan_findings_table.c.metadata_["scanner_index"].astext.cast(sa.Integer)
     stmt = (
         sa.select(scan_findings_table)
         .where(scan_findings_table.c.report_id == report_id)
         .order_by(
+            scanner_index.asc().nullslast(),
             scan_findings_table.c.meta_priority.asc().nullslast(),
-            severity_order,
             scan_findings_table.c.id,
         )
     )

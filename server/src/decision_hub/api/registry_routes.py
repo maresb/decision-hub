@@ -314,6 +314,9 @@ class ScanFindingResponse(BaseModel):
     is_false_positive: bool | None = None
     meta_confidence: str | None = None
     meta_priority: int | None = None
+    meta_impact: str | None = None
+    meta_exploitability: str | None = None
+    meta_confidence_reason: str | None = None
     metadata: dict = {}
 
 
@@ -333,13 +336,17 @@ class ScanReportResponse(BaseModel):
     meta_risk_level: str | None = None
     meta_summary: str | None = None
     meta_top_priority: str | None = None
+    meta_verdict_reasoning: str | None = None
     meta_correlations: list[dict] | None = None
     meta_recommendations: list[dict] | None = None
     meta_false_positive_count: int | None = None
+    llm_overall_assessment: str | None = None
+    llm_primary_threats: list[str] | None = None
     scanner_version: str | None = None
     scanner_model: str | None = None
     policy_name: str | None = None
     scan_duration_ms: int | None = None
+    full_report: dict | None = None
     created_at: str | None = None
 
 
@@ -904,6 +911,9 @@ def get_scan_report(
                 is_false_positive=f.is_false_positive,
                 meta_confidence=f.meta_confidence,
                 meta_priority=f.meta_priority,
+                meta_impact=f.meta_impact,
+                meta_exploitability=f.meta_exploitability,
+                meta_confidence_reason=f.meta_confidence_reason,
                 metadata=f.metadata or {},
             )
             for f in findings
@@ -915,11 +925,17 @@ def get_scan_report(
         meta_risk_level=report.meta_risk_level,
         meta_summary=report.meta_summary,
         meta_top_priority=report.meta_top_priority,
+        meta_verdict_reasoning=report.meta_verdict_reasoning,
+        meta_correlations=report.meta_correlations,
+        meta_recommendations=report.meta_recommendations,
         meta_false_positive_count=report.meta_false_positive_count,
+        llm_overall_assessment=report.llm_overall_assessment,
+        llm_primary_threats=report.llm_primary_threats,
         scanner_version=report.scanner_version,
         scanner_model=report.scanner_model,
         policy_name=report.policy_name,
         scan_duration_ms=report.scan_duration_ms,
+        full_report=report.full_report,
         created_at=report.created_at.isoformat() if report.created_at else None,
     )
 
