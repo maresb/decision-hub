@@ -47,6 +47,8 @@ from decision_hub.infra.database import (
     find_eval_run,
     find_eval_runs_for_version,
     find_org_by_slug,
+    find_scan_findings_for_report,
+    find_scan_report_for_version,
     find_skill,
     find_skill_by_slug,
     has_active_tracker_for_repo,
@@ -138,6 +140,18 @@ def _enforce_audit_log_rate_limit(request: Request) -> None:
             window_seconds=settings.audit_log_rate_window,
         )
     state._audit_log_rate_limiter(request)
+
+
+def _enforce_scan_report_rate_limit(request: Request) -> None:
+    """Rate-limit the scan report endpoint."""
+    state = request.app.state
+    if not hasattr(state, "_scan_report_rate_limiter"):
+        settings: Settings = state.settings
+        state._scan_report_rate_limiter = RateLimiter(
+            max_requests=settings.scan_report_rate_limit,
+            window_seconds=settings.scan_report_rate_window,
+        )
+    state._scan_report_rate_limiter(request)
 
 
 def _enforce_publish_rate_limit(request: Request) -> None:
@@ -282,6 +296,51 @@ class PaginatedAuditLogResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
+
+class ScanFindingResponse(BaseModel):
+    """A single finding from a Cisco scanner report."""
+
+    rule_id: str
+    category: str
+    severity: str
+    title: str
+    description: str | None = None
+    file_path: str | None = None
+    line_number: int | None = None
+    snippet: str | None = None
+    remediation: str | None = None
+    analyzer: str | None = None
+    is_false_positive: bool | None = None
+    meta_confidence: str | None = None
+    meta_priority: int | None = None
+    metadata: dict = {}
+
+
+class ScanReportResponse(BaseModel):
+    """Cisco scanner report with findings."""
+
+    id: str
+    version_id: str | None
+    is_safe: bool
+    max_severity: str
+    findings_count: int
+    findings: list[ScanFindingResponse]
+    analyzers_used: list[str]
+    analyzers_failed: list[dict]
+    analyzability_score: float | None = None
+    meta_verdict: str | None = None
+    meta_risk_level: str | None = None
+    meta_summary: str | None = None
+    meta_top_priority: str | None = None
+    meta_correlations: list[dict] | None = None
+    meta_recommendations: list[dict] | None = None
+    meta_false_positive_count: int | None = None
+    scanner_version: str | None = None
+    scanner_model: str | None = None
+    policy_name: str | None = None
+    scan_duration_ms: int | None = None
+    created_at: str | None = None
 
 
 class EvalCaseResultResponse(BaseModel):
@@ -788,6 +847,80 @@ def get_audit_log(
         page=page,
         page_size=page_size,
         total_pages=total_pages,
+    )
+
+
+@public_router.get(
+    "/skills/{org_slug}/{skill_name}/scan-report",
+    response_model=ScanReportResponse | None,
+    dependencies=[Depends(_enforce_scan_report_rate_limit)],
+)
+def get_scan_report(
+    org_slug: str,
+    skill_name: str,
+    semver: str | None = Query(None, max_length=50),
+    conn: Connection = Depends(get_connection),
+    current_user: User | None = Depends(get_current_user_optional),
+) -> ScanReportResponse | None:
+    """Return the latest Cisco scanner report for a skill version."""
+    user_org_ids = list_user_org_ids(conn, current_user.id) if current_user else None
+    skill = find_skill_by_slug(conn, org_slug, skill_name, user_org_ids=user_org_ids)
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found in {org_slug}")
+
+    version = None
+    if semver:
+        version = resolve_version(conn, skill.id, semver, allow_risky=True)
+    else:
+        version = resolve_latest_version(conn, skill.id, allow_risky=True)
+
+    if version is None:
+        return None
+
+    report = find_scan_report_for_version(conn, version.id)
+    if report is None:
+        return None
+
+    findings = find_scan_findings_for_report(conn, report.id)
+
+    return ScanReportResponse(
+        id=str(report.id),
+        version_id=str(report.version_id) if report.version_id else None,
+        is_safe=report.is_safe,
+        max_severity=report.max_severity,
+        findings_count=report.findings_count,
+        findings=[
+            ScanFindingResponse(
+                rule_id=f.rule_id,
+                category=f.category,
+                severity=f.severity,
+                title=f.title,
+                description=f.description,
+                file_path=f.file_path,
+                line_number=f.line_number,
+                snippet=f.snippet,
+                remediation=f.remediation,
+                analyzer=f.analyzer,
+                is_false_positive=f.is_false_positive,
+                meta_confidence=f.meta_confidence,
+                meta_priority=f.meta_priority,
+                metadata=f.metadata or {},
+            )
+            for f in findings
+        ],
+        analyzers_used=report.analyzers_used,
+        analyzers_failed=report.analyzers_failed,
+        analyzability_score=report.analyzability_score,
+        meta_verdict=report.meta_verdict,
+        meta_risk_level=report.meta_risk_level,
+        meta_summary=report.meta_summary,
+        meta_top_priority=report.meta_top_priority,
+        meta_false_positive_count=report.meta_false_positive_count,
+        scanner_version=report.scanner_version,
+        scanner_model=report.scanner_model,
+        policy_name=report.policy_name,
+        scan_duration_ms=report.scan_duration_ms,
+        created_at=report.created_at.isoformat() if report.created_at else None,
     )
 
 
