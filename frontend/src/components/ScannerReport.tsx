@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, Shield, AlertTriangle, Info } from "lucide-react";
+import { ChevronDown, ChevronRight, Shield, AlertTriangle, Info, Code, ExternalLink } from "lucide-react";
 import type { ScanReport, ScanFinding } from "../types/api";
 import styles from "./ScannerReport.module.css";
+
+const SCANNER_REPO = "https://github.com/cisco-ai-defense/skill-scanner";
 
 const SEVERITY_COLORS: Record<string, string> = {
   CRITICAL: "#ff4757",
@@ -18,11 +20,13 @@ const VERDICT_COLORS: Record<string, string> = {
   MALICIOUS: "#ff4757",
 };
 
-function SeverityBadge({ severity }: { severity: string }) {
-  const color = SEVERITY_COLORS[severity] || "#747d8c";
+function LabeledBadge({ label, value, color }: { label: string; value: string; color: string }) {
   return (
-    <span className={styles.severityBadge} style={{ borderColor: color, color }}>
-      {severity}
+    <span className={styles.labeledBadge}>
+      <span className={styles.badgeLabel}>{label}</span>
+      <span className={styles.badgeValue} style={{ borderColor: color, color }}>
+        {value}
+      </span>
     </span>
   );
 }
@@ -30,8 +34,11 @@ function SeverityBadge({ severity }: { severity: string }) {
 function VerdictBadge({ verdict }: { verdict: string }) {
   const color = VERDICT_COLORS[verdict] || "#747d8c";
   return (
-    <span className={styles.verdictBadge} style={{ backgroundColor: color }}>
-      {verdict}
+    <span className={styles.labeledBadge}>
+      <span className={styles.badgeLabel}>verdict</span>
+      <span className={styles.verdictValue} style={{ backgroundColor: color }}>
+        {verdict}
+      </span>
     </span>
   );
 }
@@ -39,6 +46,7 @@ function VerdictBadge({ verdict }: { verdict: string }) {
 function FindingRow({ finding }: { finding: ScanFinding }) {
   const [expanded, setExpanded] = useState(false);
   const isFP = finding.is_false_positive === true;
+  const severityColor = SEVERITY_COLORS[finding.severity] || "#747d8c";
 
   return (
     <div
@@ -47,21 +55,29 @@ function FindingRow({ finding }: { finding: ScanFinding }) {
     >
       <div className={styles.findingHeader}>
         {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <SeverityBadge severity={finding.severity} />
+        <span className={styles.severityBadge} style={{ borderColor: severityColor, color: severityColor }}>
+          {finding.severity}
+        </span>
         <span className={styles.findingTitle}>{finding.title}</span>
         {isFP && <span className={styles.fpLabel}>false positive</span>}
         {finding.meta_confidence && !isFP && (
-          <span className={styles.confidenceLabel}>{finding.meta_confidence}</span>
+          <span className={styles.confidenceLabel}>conf: {finding.meta_confidence}</span>
         )}
       </div>
       <div className={styles.findingMeta}>
         {finding.analyzer && <span>{finding.analyzer}</span>}
         {finding.category && <span>{finding.category.replace(/_/g, " ")}</span>}
-        {finding.meta_priority != null && <span>priority #{finding.meta_priority}</span>}
+        {finding.meta_impact && <span>impact: {finding.meta_impact}</span>}
+        {finding.meta_exploitability && finding.meta_exploitability !== "N/A" && (
+          <span>exploit: {finding.meta_exploitability}</span>
+        )}
       </div>
       {expanded && (
         <div className={styles.findingDetails}>
           {finding.description && <p>{finding.description}</p>}
+          {finding.meta_confidence_reason && (
+            <p className={styles.confidenceReason}>{finding.meta_confidence_reason}</p>
+          )}
           {finding.file_path && (
             <div className={styles.findingLocation}>
               {finding.file_path}
@@ -76,9 +92,9 @@ function FindingRow({ finding }: { finding: ScanFinding }) {
               <strong>Fix:</strong> {finding.remediation}
             </div>
           )}
-          {isFP && finding.metadata?.meta_reason && (
+          {isFP && finding.meta_confidence_reason && (
             <div className={styles.findingFPReason}>
-              <Info size={12} /> FP reason: {String(finding.metadata.meta_reason)}
+              <Info size={12} /> FP reason: {finding.meta_confidence_reason}
             </div>
           )}
         </div>
@@ -89,56 +105,115 @@ function FindingRow({ finding }: { finding: ScanFinding }) {
 
 export default function ScannerReport({ report }: { report: ScanReport }) {
   const [showFindings, setShowFindings] = useState(true);
-  const validatedCount = report.findings.filter(
-    (f) => f.is_false_positive !== true
-  ).length;
-  const fpCount = report.meta_false_positive_count ?? 0;
-  const verdict = report.meta_verdict || report.max_severity;
+  const [showFP, setShowFP] = useState(false);
+  const [showRawReport, setShowRawReport] = useState(false);
+
+  const realFindings = report.findings
+    .filter((f) => f.is_false_positive !== true)
+    .sort((a, b) => (a.meta_priority ?? 999) - (b.meta_priority ?? 999));
+  const fpFindings = report.findings.filter((f) => f.is_false_positive === true);
+  const fpCount = report.meta_false_positive_count ?? fpFindings.length;
   const durationSec = report.scan_duration_ms
     ? (report.scan_duration_ms / 1000).toFixed(0)
     : null;
+
+  const fpByOriginalIndex = new Map(
+    report.findings.map((f, i) => [i, f.is_false_positive === true])
+  );
+
+  const actionableCorrelations = (report.meta_correlations ?? []).filter((c) => {
+    const indices = (c.finding_indices as number[]) ?? [];
+    return indices.length === 0 || !indices.every((i) => fpByOriginalIndex.get(i));
+  });
 
   return (
     <div className={styles.scannerReport}>
       <div className={styles.reportHeader}>
         <Shield size={16} />
-        <span className={styles.reportTitle}>Scanner Report</span>
+        <a
+          href={SCANNER_REPO}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={styles.reportTitleLink}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <span className={styles.reportTitle}>Cisco Skill Scanner Report</span>
+          <ExternalLink size={11} />
+        </a>
       </div>
 
       <div className={styles.summaryBar}>
-        {report.meta_verdict ? (
-          <VerdictBadge verdict={report.meta_verdict} />
+        {report.meta_risk_level ? (
+          <LabeledBadge
+            label="risk"
+            value={report.meta_risk_level}
+            color={SEVERITY_COLORS[report.meta_risk_level] || "#747d8c"}
+          />
         ) : (
-          <SeverityBadge severity={report.max_severity} />
+          <LabeledBadge
+            label="severity"
+            value={report.max_severity}
+            color={SEVERITY_COLORS[report.max_severity] || "#747d8c"}
+          />
+        )}
+        {report.meta_verdict && (
+          <VerdictBadge verdict={report.meta_verdict} />
         )}
         <div className={styles.summaryStats}>
           <span>
-            {report.findings_count} finding{report.findings_count !== 1 ? "s" : ""}
-            {validatedCount < report.findings_count && ` (${validatedCount} validated)`}
+            {realFindings.length} finding{realFindings.length !== 1 ? "s" : ""}
           </span>
-          {fpCount > 0 && <span>{fpCount} FP filtered</span>}
+          {fpCount > 0 && <span>{fpCount} false positive{fpCount !== 1 ? "s" : ""}</span>}
           {report.analyzability_score != null && (
             <span>
-              Score: {Math.round(report.analyzability_score)}%
+              analyzability: {Math.round(report.analyzability_score)}%
             </span>
           )}
         </div>
       </div>
 
       {report.meta_summary && (
-        <p className={styles.metaSummary}>{report.meta_summary}</p>
+        <p className={styles.metaSummary}>
+          <strong>Summary:</strong> {report.meta_summary}
+        </p>
       )}
 
-      {report.meta_correlations && report.meta_correlations.length > 0 && (
+      {report.meta_verdict_reasoning && (
+        <p className={styles.verdictReasoning}>
+          <strong>Reasoning:</strong> {report.meta_verdict_reasoning}
+        </p>
+      )}
+
+      {report.llm_primary_threats && report.llm_primary_threats.length > 0 && (
+        <div className={styles.primaryThreats}>
+          {report.llm_primary_threats.map((t, i) => (
+            <span key={i} className={styles.threatTag}>{t}</span>
+          ))}
+        </div>
+      )}
+
+      {report.llm_overall_assessment && !report.meta_summary && (
+        <p className={styles.metaSummary}>{report.llm_overall_assessment}</p>
+      )}
+
+      {actionableCorrelations.length > 0 && (
         <div className={styles.correlations}>
           <h4>Correlated Findings</h4>
-          {report.meta_correlations.map((c, i) => (
+          {actionableCorrelations.map((c, i) => (
             <div key={i} className={styles.correlationGroup}>
               <div className={styles.correlationHeader}>
                 <AlertTriangle size={14} />
                 <strong>{String(c.group_name || `Group ${i + 1}`)}</strong>
                 {c.combined_severity && (
-                  <SeverityBadge severity={String(c.combined_severity)} />
+                  <span
+                    className={styles.severityBadge}
+                    style={{
+                      borderColor: SEVERITY_COLORS[String(c.combined_severity)] || "#747d8c",
+                      color: SEVERITY_COLORS[String(c.combined_severity)] || "#747d8c",
+                    }}
+                  >
+                    {String(c.combined_severity)}
+                  </span>
                 )}
               </div>
               {c.relationship && (
@@ -153,6 +228,41 @@ export default function ScannerReport({ report }: { report: ScanReport }) {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {report.findings.length > 0 && (
+        <div className={styles.findingsSection}>
+          <button
+            className={styles.findingsToggle}
+            onClick={() => setShowFindings(!showFindings)}
+          >
+            {showFindings ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Findings ({realFindings.length})
+          </button>
+          {showFindings && (
+            <div className={styles.findingsList}>
+              {realFindings.map((f, i) => (
+                <FindingRow key={`${f.rule_id}-${i}`} finding={f} />
+              ))}
+              {fpFindings.length > 0 && (
+                <div
+                  className={`${styles.findingRow} ${styles.findingFP}`}
+                  onClick={() => setShowFP(!showFP)}
+                >
+                  <div className={styles.findingHeader}>
+                    {showFP ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    <span className={styles.findingTitle}>
+                      {fpFindings.length} false positive{fpFindings.length !== 1 ? "s" : ""} filtered
+                    </span>
+                  </div>
+                </div>
+              )}
+              {showFP && fpFindings.map((f, i) => (
+                <FindingRow key={`fp-${f.rule_id}-${i}`} finding={f} />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -173,25 +283,6 @@ export default function ScannerReport({ report }: { report: ScanReport }) {
         </div>
       )}
 
-      {report.findings.length > 0 && (
-        <div className={styles.findingsSection}>
-          <button
-            className={styles.findingsToggle}
-            onClick={() => setShowFindings(!showFindings)}
-          >
-            {showFindings ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-            Findings ({report.findings.length})
-          </button>
-          {showFindings && (
-            <div className={styles.findingsList}>
-              {report.findings.map((f, i) => (
-                <FindingRow key={`${f.rule_id}-${i}`} finding={f} />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
       <div className={styles.reportFooter}>
         <span>
           Analyzers: {report.analyzers_used.join(", ")}
@@ -202,6 +293,24 @@ export default function ScannerReport({ report }: { report: ScanReport }) {
           <span>Scanner v{report.scanner_version}</span>
         )}
       </div>
+
+      {report.full_report && (
+        <div className={styles.rawReportSection}>
+          <button
+            className={styles.findingsToggle}
+            onClick={() => setShowRawReport(!showRawReport)}
+          >
+            {showRawReport ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            <Code size={14} />
+            Raw Report
+          </button>
+          {showRawReport && (
+            <pre className={styles.rawReport}>
+              {JSON.stringify(report.full_report, null, 2)}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }
