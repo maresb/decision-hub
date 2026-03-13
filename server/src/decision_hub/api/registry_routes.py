@@ -870,9 +870,9 @@ def get_scan_report(
 
     version = None
     if semver:
-        version = resolve_version(conn, skill.id, semver, allow_risky=True)
+        version = resolve_version(conn, org_slug, skill_name, semver, allow_risky=True, user_org_ids=user_org_ids)
     else:
-        version = resolve_latest_version(conn, skill.id, allow_risky=True)
+        version = resolve_latest_version(conn, org_slug, skill_name, user_org_ids=user_org_ids)
 
     if version is None:
         return None
