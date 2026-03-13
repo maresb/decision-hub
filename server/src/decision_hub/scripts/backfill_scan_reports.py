@@ -20,7 +20,6 @@ Usage:
 import argparse
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from uuid import UUID
 
 import sqlalchemy as sa
 from loguru import logger

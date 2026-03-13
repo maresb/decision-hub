@@ -12,8 +12,6 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
-import pytest
-
 from decision_hub.domain.skill_scanner_bridge import (
     _error_result,
     _find_skill_root,
@@ -21,7 +19,6 @@ from decision_hub.domain.skill_scanner_bridge import (
     scan_skill_zip,
     store_scan_result,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers: Fake scanner types
@@ -68,9 +65,7 @@ class FakeScanResult:
 
     @property
     def is_safe(self) -> bool:
-        return not any(
-            f.severity.value in ("CRITICAL", "HIGH") for f in self.findings
-        )
+        return not any(f.severity.value in ("CRITICAL", "HIGH") for f in self.findings)
 
     @property
     def max_severity(self) -> FakeSeverity:
@@ -113,12 +108,14 @@ class TestMapFindings:
         assert mapped["analyzer"] == "static"
 
     def test_maps_meta_enrichment(self):
-        f = FakeFinding(metadata={
-            "meta_false_positive": True,
-            "meta_confidence": "HIGH",
-            "meta_priority": 1,
-            "meta_reason": "keyword in comment",
-        })
+        f = FakeFinding(
+            metadata={
+                "meta_false_positive": True,
+                "meta_confidence": "HIGH",
+                "meta_priority": 1,
+                "meta_reason": "keyword in comment",
+            }
+        )
         result = _map_findings([f])
         mapped = result[0]
         assert mapped["is_false_positive"] is True
@@ -157,9 +154,17 @@ class TestErrorResult:
     def test_has_all_required_keys(self):
         result = _error_result(0)
         required = {
-            "is_safe", "max_severity", "findings_count", "analyzers_used",
-            "analyzers_failed", "full_report", "meta_analysis", "scan_metadata",
-            "findings", "scanner_version", "scan_duration_ms",
+            "is_safe",
+            "max_severity",
+            "findings_count",
+            "analyzers_used",
+            "analyzers_failed",
+            "full_report",
+            "meta_analysis",
+            "scan_metadata",
+            "findings",
+            "scanner_version",
+            "scan_duration_ms",
         }
         assert required.issubset(result.keys())
 
@@ -201,6 +206,7 @@ class TestScanSkillZip:
         # Create a minimal zip with SKILL.md
         import io
         import zipfile
+
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             zf.writestr("SKILL.md", "---\nname: test\ndescription: test\n---\n# Test")
@@ -246,6 +252,7 @@ class TestScanSkillZip:
 
         import io
         import zipfile
+
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             zf.writestr("SKILL.md", "---\nname: safe\ndescription: safe\n---\n")
@@ -302,8 +309,12 @@ class TestStoreScanResult:
 
         conn = MagicMock()
         report_id = store_scan_result(
-            conn, scan_data,
-            version_id=uuid4(), org_slug="test", skill_name="skill", semver="1.0.0",
+            conn,
+            scan_data,
+            version_id=uuid4(),
+            org_slug="test",
+            skill_name="skill",
+            semver="1.0.0",
         )
 
         mock_report.assert_called_once()
@@ -320,8 +331,12 @@ class TestStoreScanResult:
 
         conn = MagicMock()
         store_scan_result(
-            conn, scan_data,
-            version_id=None, org_slug="test", skill_name="s", semver="1.0.0",
+            conn,
+            scan_data,
+            version_id=None,
+            org_slug="test",
+            skill_name="s",
+            semver="1.0.0",
         )
 
         mock_findings.assert_not_called()

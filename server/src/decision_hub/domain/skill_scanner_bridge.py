@@ -141,22 +141,24 @@ def _map_findings(findings: list[Any]) -> list[dict]:
         category = f.category.value if hasattr(f.category, "value") else str(f.category)
         meta = f.metadata if hasattr(f, "metadata") else {}
 
-        mapped.append({
-            "rule_id": f.rule_id,
-            "category": category,
-            "severity": severity,
-            "title": f.title,
-            "description": f.description,
-            "file_path": f.file_path,
-            "line_number": f.line_number,
-            "snippet": getattr(f, "snippet", None),
-            "remediation": getattr(f, "remediation", None),
-            "analyzer": getattr(f, "analyzer", None),
-            "is_false_positive": meta.get("meta_false_positive"),
-            "meta_confidence": meta.get("meta_confidence"),
-            "meta_priority": meta.get("meta_priority"),
-            "metadata": meta,
-        })
+        mapped.append(
+            {
+                "rule_id": f.rule_id,
+                "category": category,
+                "severity": severity,
+                "title": f.title,
+                "description": f.description,
+                "file_path": f.file_path,
+                "line_number": f.line_number,
+                "snippet": getattr(f, "snippet", None),
+                "remediation": getattr(f, "remediation", None),
+                "analyzer": getattr(f, "analyzer", None),
+                "is_false_positive": meta.get("meta_false_positive"),
+                "meta_confidence": meta.get("meta_confidence"),
+                "meta_priority": meta.get("meta_priority"),
+                "metadata": meta,
+            }
+        )
     return mapped
 
 
@@ -186,9 +188,7 @@ def scan_skill_zip(zip_bytes: bytes, settings: Settings) -> dict:
 
             meta_result, meta_error = _run_meta_analysis(result, skill_dir, settings, policy)
             if meta_error is not None:
-                logger.opt(exception=meta_error).warning(
-                    "Meta-analysis failed — using scan results as-is"
-                )
+                logger.opt(exception=meta_error).warning("Meta-analysis failed — using scan results as-is")
     except (ImportError, MemoryError, zipfile.BadZipFile, ValueError):
         raise
     except Exception:
@@ -210,22 +210,14 @@ def scan_skill_zip(zip_bytes: bytes, settings: Settings) -> dict:
         "analyzers_used": list(result.analyzers_used),
         "analyzers_failed": list(getattr(result, "analyzers_failed", []) or []),
         "analyzability_score": result.analyzability_score,
-        "analyzability_details": (
-            result.analyzability_details if hasattr(result, "analyzability_details") else None
-        ),
+        "analyzability_details": (result.analyzability_details if hasattr(result, "analyzability_details") else None),
         "meta_verdict": overall_risk.get("skill_verdict"),
         "meta_risk_level": overall_risk.get("risk_level"),
         "meta_summary": overall_risk.get("summary"),
         "meta_top_priority": overall_risk.get("top_priority"),
-        "meta_correlations": (
-            meta_result.correlations if meta_result and meta_result.correlations else None
-        ),
-        "meta_recommendations": (
-            meta_result.recommendations if meta_result and meta_result.recommendations else None
-        ),
-        "meta_false_positive_count": (
-            len(meta_result.false_positives) if meta_result else None
-        ),
+        "meta_correlations": (meta_result.correlations if meta_result and meta_result.correlations else None),
+        "meta_recommendations": (meta_result.recommendations if meta_result and meta_result.recommendations else None),
+        "meta_false_positive_count": (len(meta_result.false_positives) if meta_result else None),
         "scanner_version": _get_scanner_version(),
         "scanner_model": f"gemini/{settings.gemini_model}" if settings.google_api_key else None,
         "policy_name": settings.cisco_scanner_policy,
