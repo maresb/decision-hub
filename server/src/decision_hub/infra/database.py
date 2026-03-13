@@ -395,7 +395,7 @@ scan_reports_table = Table(
     "scan_reports",
     metadata,
     Column("id", PG_UUID(as_uuid=True), primary_key=True, server_default=sa.func.gen_random_uuid()),
-    Column("version_id", PG_UUID(as_uuid=True), ForeignKey("skill_versions.id", ondelete="CASCADE"), nullable=True),
+    Column("version_id", PG_UUID(as_uuid=True), ForeignKey("versions.id", ondelete="CASCADE"), nullable=True),
     Column("org_slug", Text, nullable=False),
     Column("skill_name", Text, nullable=False),
     Column("semver", Text, nullable=False),

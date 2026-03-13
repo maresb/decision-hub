@@ -1,15 +1,29 @@
 -- Cisco skill-scanner integration: scan_reports + scan_findings tables.
 -- Stores scanner results alongside the gauntlet's eval_audit_logs.
 --
--- Clean slate: drop any leftover tables from the PR #191 branch
--- that may have been applied to the dev database during testing.
-DROP TABLE IF EXISTS scan_findings;
-DROP TABLE IF EXISTS scan_reports;
+-- Detects and drops leftover tables from the old PR #191 branch (which had
+-- a different schema with a "grade" column). Leaves our own tables intact
+-- if they already exist (idempotent via IF NOT EXISTS).
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'scan_reports'
+          AND column_name = 'grade'
+    ) THEN
+        RAISE NOTICE 'Detected old PR #191 scan_reports schema — dropping';
+        DROP TABLE IF EXISTS scan_findings;
+        DROP TABLE IF EXISTS scan_reports;
+    END IF;
+END
+$$;
 
 -- One row per scan execution (one per publish or backfill run)
-CREATE TABLE scan_reports (
+CREATE TABLE IF NOT EXISTS scan_reports (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    version_id              UUID REFERENCES skill_versions(id) ON DELETE CASCADE,
+    version_id              UUID REFERENCES versions(id) ON DELETE CASCADE,
     org_slug                TEXT NOT NULL,
     skill_name              TEXT NOT NULL,
     semver                  TEXT NOT NULL,
@@ -53,17 +67,18 @@ CREATE TABLE scan_reports (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_scan_reports_version ON scan_reports(version_id);
-CREATE INDEX idx_scan_reports_skill ON scan_reports(org_slug, skill_name);
+CREATE INDEX IF NOT EXISTS idx_scan_reports_version ON scan_reports(version_id);
+CREATE INDEX IF NOT EXISTS idx_scan_reports_skill ON scan_reports(org_slug, skill_name);
 
 ALTER TABLE scan_reports ENABLE ROW LEVEL SECURITY;
 
+DROP TRIGGER IF EXISTS set_scan_reports_updated_at ON scan_reports;
 CREATE TRIGGER set_scan_reports_updated_at
     BEFORE UPDATE ON scan_reports
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- Denormalized findings for querying and display
-CREATE TABLE scan_findings (
+CREATE TABLE IF NOT EXISTS scan_findings (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     report_id           UUID NOT NULL REFERENCES scan_reports(id) ON DELETE CASCADE,
 
@@ -89,7 +104,7 @@ CREATE TABLE scan_findings (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_scan_findings_report ON scan_findings(report_id);
-CREATE INDEX idx_scan_findings_severity ON scan_findings(severity);
+CREATE INDEX IF NOT EXISTS idx_scan_findings_report ON scan_findings(report_id);
+CREATE INDEX IF NOT EXISTS idx_scan_findings_severity ON scan_findings(severity);
 
 ALTER TABLE scan_findings ENABLE ROW LEVEL SECURITY;
