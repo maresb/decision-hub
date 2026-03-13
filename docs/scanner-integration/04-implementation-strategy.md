@@ -1,6 +1,6 @@
-# Implementation Strategy: Parallel Cisco Scanner Integration (Revised)
+# Implementation Strategy: Parallel Cisco Scanner Integration (v3)
 
-**Date**: 2026-03-13 (revised)
+**Date**: 2026-03-13 (v3)
 
 ---
 
@@ -13,49 +13,403 @@ From the PR #191 discussion, the agreed plan is:
 > - update the UI to show both results
 > - cherry-pick the tests from arXiv
 
-This is a **clean-slate implementation**. Nothing from the PR #191 branch is being rebased or cherry-picked as code — the old branch is reference material only. The gauntlet remains the sole decision-maker for publish/reject. The Cisco scanner runs in parallel for data collection, and its results are stored and displayed alongside the gauntlet's letter grade.
+This is a **clean-slate, single-PR implementation**. The gauntlet remains the sole decision-maker for publish/reject. The scanner runs alongside it, and its native results (findings, meta-analysis verdict, risk assessment, correlations, recommendations) are stored and displayed in the UI next to the gauntlet's letter grade.
 
 ---
 
-## Design Principles
+## Database Cleanup
 
-1. **Gauntlet stays in control** — scanner never affects publish/reject decisions
-2. **Additive only** — new tables created fresh, existing tables untouched
-3. **Feature-flagged** — `enable_cisco_scanner` in settings, defaults to `False`
-4. **Thread-safe** — no global state mutation; each scan call is self-contained
-5. **Fail-open for the scanner** — scanner errors never block publishing
-6. **Comprehensive scan** — use all available analyzers (static, behavioral, pipeline, bytecode, trigger, LLM, meta-analysis) to maximize the value of the data we collect
-7. **Native output** — store and display scanner results in their own format, not mapped to gauntlet concepts
+The PR #191 branch created `scan_reports` and `scan_findings` tables on the dev database during testing. These need to be dropped and recreated cleanly as part of our new migration.
+
+The migration should:
+
+```sql
+-- Clean slate: drop any leftover tables from the PR #191 branch
+DROP TABLE IF EXISTS scan_findings;
+DROP TABLE IF EXISTS scan_reports;
+```
+
+This is safe because these tables only contain test data from the old branch's backfill runs, and were never exposed in production. The gauntlet's `eval_audit_logs` table is **not touched** — it stays exactly as-is.
 
 ---
 
-## Comprehensive Scanner Configuration
+## Scanner Output: Complete Data Model
 
-The scanner in 2.0.3 has a rich set of analyzers. For maximum data value, we should run the full pipeline:
+The scanner produces a rich, multi-layered output. The previous drafts flattened this into a single "verdict". Here's the full picture of what the scanner actually produces and what we should store.
 
-### Analyzers to Enable
+### Layer 1: ScanResult (from `scanner.scan_skill()`)
 
-| Analyzer | Flag | What it does | Cost |
-|----------|------|-------------|------|
-| **Static** | Always on | 13-pass static analysis: YARA rules, regex signatures, manifest validation, homoglyphs, prompt injection in assets | Free (CPU only) |
-| **Bytecode** | Always on | `.pyc` without `.py` source, AST mismatch detection | Free |
-| **Pipeline** | Always on | Shell taint flow tracking (source → sink) | Free |
-| **Behavioral** | `use_behavioral=True` | AST dataflow analysis, import graph, capability mapping | Free |
-| **Trigger** | `use_trigger=True` | Description specificity analysis (overly generic → suspicious) | Free |
-| **LLM** | `use_llm=True` | Semantic analysis via Gemini | ~1 LLM call per skill |
-| **Meta-analysis** | Post-processing | Cross-validates findings, filters FPs, correlation groups | ~1 LLM call per skill |
+```python
+@dataclass
+class ScanResult:
+    skill_name: str
+    skill_directory: str
+    findings: list[Finding]               # The core output
+    scan_duration_seconds: float
+    analyzers_used: list[str]             # e.g. ["static", "bytecode", "pipeline", "behavioral", "trigger", "llm"]
+    analyzers_failed: list[dict[str, str]]  # e.g. [{"analyzer": "llm_analyzer", "error": "..."}]
+    timestamp: datetime
+    analyzability_score: float | None     # 0-100
+    analyzability_details: dict | None    # {score, total_files, analyzed_files, risk_level, unanalyzable_file_list}
+    scan_metadata: dict | None            # policy fingerprint, llm_overall_assessment, llm_primary_threats
 
-All free analyzers should always run. The LLM analyzer and meta-analysis should run when `google_api_key` is available (which it always is in dev/prod). This gives us the full 2-phase pipeline: deterministic engines first, then LLM enriched with Phase 1 context.
+    # Computed properties:
+    is_safe: bool       # True if no CRITICAL/HIGH findings
+    max_severity: Severity  # Highest severity across all findings
+```
 
-### Policy Selection
+### Layer 2: Individual Findings
 
-Use `balanced` as the default policy. This can be overridden via `cisco_scanner_policy` in settings. The policy engine is one of 2.0's best features — it directly addresses the false-positive problem from the 1.0.2 era. If the backfill shows too many false positives, we can switch to `permissive` without code changes.
+Each finding has:
 
-### Bridge Configuration Code (Sketch)
+```python
+@dataclass
+class Finding:
+    id: str                    # Unique ID (rule_id + line + context hash)
+    rule_id: str               # e.g. "COMMAND_INJECTION_SUBPROCESS", "LLM_ANALYSIS_FAILED"
+    category: ThreatCategory   # e.g. "command_injection", "data_exfiltration", "prompt_injection"
+    severity: Severity         # CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE
+    title: str
+    description: str
+    file_path: str | None
+    line_number: int | None
+    snippet: str | None
+    remediation: str | None
+    analyzer: str | None       # "static", "llm", "behavioral", "pipeline", "meta_analyzer", etc.
+    metadata: dict             # After meta-analysis, enriched with:
+                               #   meta_false_positive: bool
+                               #   meta_reason: str (if FP)
+                               #   meta_validated: bool (if TP)
+                               #   meta_confidence: "HIGH" | "MEDIUM" | "LOW"
+                               #   meta_confidence_reason: str
+                               #   meta_exploitability: str
+                               #   meta_impact: str
+                               #   meta_priority: int (rank in priority order)
+```
+
+### Layer 3: MetaAnalysisResult (from `meta.analyze_with_findings()`)
+
+The meta-analyzer is a senior-analyst LLM pass that cross-validates findings from all other analyzers. It produces:
+
+```python
+@dataclass
+class MetaAnalysisResult:
+    validated_findings: list[dict]    # Confirmed true positives with confidence/exploitability/impact
+    false_positives: list[dict]       # Findings identified as FPs with reasons
+    missed_threats: list[dict]        # NEW threats the meta-analyzer found that others missed
+    priority_order: list[int]         # Finding indices ordered by what to fix first
+    correlations: list[dict]          # Groups of related findings (e.g. "Credential Theft Chain")
+                                      #   Each: {group_name, finding_indices, relationship,
+                                      #          combined_severity, consolidated_remediation}
+    recommendations: list[dict]       # Actionable items (e.g. "Remove hardcoded credentials")
+                                      #   Each: {priority, title, affected_findings, fix, effort}
+    overall_risk_assessment: dict     # The "verdict":
+                                      #   risk_level: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "SAFE"
+                                      #   summary: str (one-sentence assessment)
+                                      #   top_priority: str (single most important thing to fix)
+                                      #   skill_verdict: "SAFE" | "SUSPICIOUS" | "MALICIOUS"
+                                      #   verdict_reasoning: str
+```
+
+### Layer 4: LLM Analyzer's Own Assessment
+
+The LLM analyzer (separate from meta) also produces a skill-level assessment captured in `scan_metadata`:
+
+```python
+scan_metadata = {
+    "policy_name": "balanced",
+    # ... policy fingerprint fields ...
+    "llm_overall_assessment": "This skill appears safe. ...",
+    "llm_primary_threats": ["prompt_injection", "data_exfiltration"],
+}
+```
+
+### What This Means for the Data Model
+
+The scanner doesn't have a single "verdict" — it has **four layers of signal**:
+
+1. **`ScanResult.is_safe`** / **`ScanResult.max_severity`** — mechanical rollup (any CRITICAL/HIGH = unsafe)
+2. **Per-finding metadata** — after meta-analysis, each finding has `meta_false_positive`, confidence, priority
+3. **`MetaAnalysisResult.overall_risk_assessment`** — the LLM meta-analyst's expert opinion: `risk_level`, `skill_verdict` (SAFE/SUSPICIOUS/MALICIOUS), reasoning
+4. **`MetaAnalysisResult.correlations`** + **`recommendations`** — the highest-value output: correlated attack chains and actionable fixes
+
+All four layers should be stored and surfaceable in the UI.
+
+---
+
+## Database Schema
+
+### `scan_reports`
+
+```sql
+CREATE TABLE IF NOT EXISTS scan_reports (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    version_id          UUID REFERENCES skill_versions(id) ON DELETE CASCADE,
+    org_slug            TEXT NOT NULL,
+    skill_name          TEXT NOT NULL,
+    semver              TEXT NOT NULL,
+
+    -- Layer 1: ScanResult mechanical rollup
+    is_safe             BOOLEAN NOT NULL,
+    max_severity        TEXT NOT NULL,           -- CRITICAL/HIGH/MEDIUM/LOW/INFO/SAFE
+    findings_count      INTEGER NOT NULL DEFAULT 0,
+
+    -- Analyzer metadata
+    analyzers_used      TEXT[] NOT NULL DEFAULT '{}',
+    analyzers_failed    JSONB DEFAULT '[]',      -- [{analyzer, error}]
+
+    -- Analyzability
+    analyzability_score REAL,                    -- 0-100
+    analyzability_details JSONB,                 -- {score, total_files, analyzed_files, risk_level, ...}
+
+    -- Layer 3: Meta-analysis verdict (NULL if meta didn't run)
+    meta_verdict        TEXT,                    -- SAFE / SUSPICIOUS / MALICIOUS
+    meta_risk_level     TEXT,                    -- CRITICAL / HIGH / MEDIUM / LOW / SAFE
+    meta_summary        TEXT,                    -- One-sentence expert assessment
+    meta_top_priority   TEXT,                    -- Single most important fix
+
+    -- Meta-analysis structured data
+    meta_correlations   JSONB,                   -- Correlated finding groups
+    meta_recommendations JSONB,                  -- Actionable fix items
+    meta_false_positive_count INTEGER,           -- How many findings meta filtered as FP
+
+    -- Scan configuration
+    scanner_version     TEXT,
+    scanner_model       TEXT,                    -- e.g. "gemini/gemini-3.1-flash-lite-preview"
+    policy_name         TEXT,                    -- e.g. "balanced"
+    scan_duration_ms    INTEGER,
+
+    -- Full blobs (for download / deep inspection)
+    full_report         JSONB,                   -- ScanResult.to_dict()
+    meta_analysis       JSONB,                   -- MetaAnalysisResult.to_dict()
+    scan_metadata       JSONB,                   -- policy fingerprint, llm_overall_assessment, etc.
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_reports_version ON scan_reports(version_id);
+CREATE INDEX IF NOT EXISTS idx_scan_reports_skill ON scan_reports(org_slug, skill_name);
+
+ALTER TABLE scan_reports ENABLE ROW LEVEL SECURITY;
+
+CREATE TRIGGER set_scan_reports_updated_at
+    BEFORE UPDATE ON scan_reports
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+```
+
+### `scan_findings`
+
+```sql
+CREATE TABLE IF NOT EXISTS scan_findings (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_id       UUID NOT NULL REFERENCES scan_reports(id) ON DELETE CASCADE,
+
+    -- Core finding fields
+    rule_id         TEXT NOT NULL,
+    category        TEXT NOT NULL,               -- ThreatCategory value
+    severity        TEXT NOT NULL,               -- Severity value
+    title           TEXT NOT NULL,
+    description     TEXT,
+    file_path       TEXT,
+    line_number     INTEGER,
+    snippet         TEXT,
+    remediation     TEXT,
+    analyzer        TEXT,                        -- Which analyzer produced this
+
+    -- Meta-analysis enrichment (populated after meta runs)
+    is_false_positive   BOOLEAN,                 -- meta_false_positive
+    meta_confidence     TEXT,                    -- HIGH / MEDIUM / LOW
+    meta_priority       INTEGER,                 -- Position in priority order
+
+    -- Full metadata blob (includes aitech_code, policy fingerprint, etc.)
+    metadata        JSONB NOT NULL DEFAULT '{}',
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_findings_report ON scan_findings(report_id);
+CREATE INDEX IF NOT EXISTS idx_scan_findings_severity ON scan_findings(severity);
+
+ALTER TABLE scan_findings ENABLE ROW LEVEL SECURITY;
+```
+
+### Design Rationale
+
+**Why denormalize meta-analysis fields into both tables?**
+- `scan_reports` gets the top-level verdict (`meta_verdict`, `meta_risk_level`, `meta_summary`) for list-view display without JOINs
+- `scan_findings` gets per-finding enrichment (`is_false_positive`, `meta_confidence`, `meta_priority`) for filtering/sorting in the detail view
+- The full blobs (`meta_analysis` JSONB) are preserved for debugging and future use
+
+**Why not a `grade` column?**
+The scanner's `meta_verdict` (SAFE/SUSPICIOUS/MALICIOUS) and `meta_risk_level` (CRITICAL-SAFE) are richer than a letter grade and are its native language. If we want to show a letter grade derived from scanner results, we compute it at display time.
+
+---
+
+## Scan Policy
+
+### Which Preset?
+
+The three presets differ primarily in:
+
+| Dimension | Strict | Balanced | Permissive |
+|-----------|--------|----------|------------|
+| Hidden file allowlist | 6 files, 3 dirs | ~50 files, ~16 dirs | ~70 files, ~30 dirs |
+| Pipeline taint | No trusted domains, no benign pipes | 16 trusted domains, 7 pipe patterns | 26 trusted domains, 11 pipe patterns |
+| Rule scoping | Rules fire everywhere | Some rules skip docs | More rules skip docs |
+| Credential suppression | Minimal | Known test values | Extended test values |
+| File limits | `100 files, 5MB` | Same | `500 files, 20MB` |
+| Severity overrides | None | None | 3 rules demoted |
+| Disabled rules | None | None | 7 rules disabled entirely |
+| LLM context budget | Default (20K/15K/100K) | Same | 2.5x (50K/30K/200K) |
+
+**Recommendation: `balanced`** for the initial deployment. Rationale:
+
+1. `balanced` is the scanner's default and most tested preset
+2. It has sensible rule scoping (skip code-injection rules in doc files) without over-suppressing
+3. It doesn't disable any rules, so we get the fullest signal
+4. The 26% F-rate problem from PR #191 was on scanner 1.0.2 without meta-analysis or finding dedup — 2.0.3's meta-analyzer, dedup, and policy engine should significantly reduce FPs without needing `permissive`
+5. If the backfill shows too many FPs, switching to `permissive` is a settings change, not a code change
+
+### Custom Policy Considerations
+
+We might want a custom policy that tweaks `balanced` for our specific use case. Candidates:
+
+```yaml
+# dhub_policy.yaml — balanced with dhub-specific overrides
+policy_name: dhub
+policy_version: "1.0"
+preset_base: balanced
+
+# Our skills often legitimately use shell commands and network
+# Demote tool-use findings that are expected in agent skills
+severity_overrides:
+  - rule_id: TOOL_ABUSE_SYSTEM_PACKAGE_INSTALL
+    severity: LOW
+    reason: "Agent skills commonly install system packages"
+
+# Increase LLM context for larger skills
+llm_analysis:
+  max_instruction_body_chars: 40000
+  max_code_file_chars: 25000
+  max_total_prompt_chars: 150000
+  max_output_tokens: 16384
+```
+
+However, we should **start with stock `balanced`** and only create a custom policy after analyzing the backfill data. Premature customization hides real signals.
+
+### Settings
+
+```python
+# settings.py additions
+enable_cisco_scanner: bool = False
+cisco_scanner_policy: str = "balanced"   # "strict" | "balanced" | "permissive" | path to YAML
+```
+
+---
+
+## UI Presentation
+
+### Gauntlet: Unchanged
+
+The existing Audit tab continues to show gauntlet results exactly as they are: letter grade badge (A/B/C/F), check results grid, quarantine info.
+
+### Scanner Report: New Section
+
+Below each gauntlet audit entry, when a scan report exists for that version, a "Scanner Report" section appears. This section shows the scanner's results in their native format.
+
+#### Summary Header
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Scanner Report                                                 │
+│                                                                 │
+│  ┌──────────┐  ┌──────────────┐  ┌───────────┐  ┌───────────┐ │
+│  │   SAFE   │  │ 5 findings   │  │ 2 FPs     │  │ Score: 94 │ │
+│  │  verdict │  │ (3 validated)│  │ filtered  │  │ ████████░ │ │
+│  └──────────┘  └──────────────┘  └───────────┘  └───────────┘ │
+│                                                                 │
+│  "Skill appears safe. Minor description-vs-implementation       │
+│   mismatch detected but not exploitable." — meta-analysis       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The summary bar shows:
+- **Meta verdict badge**: SAFE (green) / SUSPICIOUS (yellow) / MALICIOUS (red). Falls back to `max_severity` if meta didn't run.
+- **Finding counts**: total, validated (non-FP), false positives filtered
+- **Analyzability score**: percentage bar
+- **Meta summary**: the one-sentence expert assessment from `overall_risk_assessment.summary`
+
+#### Correlations (if any)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ▾ Correlated: "Credential Theft Chain"  (CRITICAL)             │
+│    Findings #1, #3, #5 form a credential exfiltration attack    │
+│    Fix: Replace hardcoded keys with environment variables       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+These are the meta-analyzer's correlation groups — the highest-value output. Each shows the group name, combined severity, relationship description, and consolidated remediation.
+
+#### Recommendations (if any)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Recommendations                                                │
+│  1. Remove hardcoded credentials  (LOW effort, findings #0, #1) │
+│  2. Narrow skill description      (LOW effort, finding #2)      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Findings List
+
+Expandable, sorted by meta_priority (then severity). Each finding shows:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ▸ MEDIUM  Over-broad Capability Claims        [validated, HIGH]│
+│    static_analyzer · prompt_injection · meta_priority: 1        │
+│                                                                 │
+│  ▸ LOW  Undeclared network capability           [validated, MED]│
+│    behavioral · unauthorized_tool_use · meta_priority: 2        │
+│                                                                 │
+│  ▸ INFO  LLM context budget exceeded           [false positive] │
+│    meta_analyzer · policy_violation                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Expanding a finding shows: description, file path + line number, code snippet, remediation, exploitability/impact from meta.
+
+False positives are shown dimmed/struck-through with the meta's reason, not hidden — transparency is the goal.
+
+#### Metadata Footer
+
+```
+Analyzers: static, behavioral, pipeline, bytecode, trigger, llm, meta
+Policy: balanced │ Duration: 34s │ Scanner v2.0.3
+```
+
+### Feature Flag
+
+```typescript
+// frontend/src/featureFlags.ts
+export const SHOW_SCANNER_REPORT = false;
+```
+
+---
+
+## Comprehensive Scanner Run
+
+### Analyzer Configuration
+
+Use `build_analyzers()` with all engines enabled:
 
 ```python
 from skill_scanner.core.analyzer_factory import build_analyzers
 from skill_scanner.core.scan_policy import ScanPolicy
+from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer, apply_meta_analysis_to_results
+from skill_scanner import SkillScanner
 
 policy = ScanPolicy.from_preset(settings.cisco_scanner_policy)
 
@@ -66,12 +420,21 @@ analyzers = build_analyzers(
     llm_model=f"gemini/{settings.gemini_model}",
     llm_api_key=settings.google_api_key,
     use_trigger=True,
+    llm_max_tokens=16384,   # more than the default 8192 for richer output
 )
 
 scanner = SkillScanner(analyzers=analyzers, policy=policy)
 result = scanner.scan_skill(skill_dir)
+```
 
-# Meta-analysis as post-processing (if LLM available and findings exist)
+This runs: static (13 passes), bytecode, pipeline, behavioral, trigger, LLM (with Phase 1 enrichment). The scanner's internal two-phase execution handles passing Phase 1 context to the LLM automatically.
+
+### Meta-Analysis (Post-Processing)
+
+Meta-analysis is a separate step. It requires findings from the scan:
+
+```python
+meta_result = None
 if settings.google_api_key and result.findings:
     meta = MetaAnalyzer(
         model=f"gemini/{settings.gemini_model}",
@@ -79,387 +442,146 @@ if settings.google_api_key and result.findings:
         policy=policy,
     )
     meta_result = await meta.analyze_with_findings(
-        skill=skill, findings=result.findings, analyzers_used=result.analyzers_used,
+        skill=loaded_skill,
+        findings=result.findings,
+        analyzers_used=result.analyzers_used,
     )
     result.findings = apply_meta_analysis_to_results(
-        original_findings=result.findings, meta_result=meta_result, skill=skill,
+        original_findings=result.findings,
+        meta_result=meta_result,
+        skill=loaded_skill,
     )
+    if "meta_analyzer" not in result.analyzers_used:
+        result.analyzers_used.append("meta_analyzer")
 ```
 
-This is the equivalent of `skill-scanner scan /path --use-behavioral --use-llm --use-trigger --enable-meta --policy balanced`.
+After `apply_meta_analysis_to_results`, every finding's `metadata` dict is enriched with `meta_false_positive`, `meta_confidence`, `meta_priority`, etc.
 
----
+### What Gets Stored
 
-## Data Model
+```python
+# scan_reports row
+{
+    "is_safe": result.is_safe,
+    "max_severity": result.max_severity.value,
+    "findings_count": len(result.findings),
+    "analyzers_used": result.analyzers_used,
+    "analyzers_failed": result.analyzers_failed,
+    "analyzability_score": result.analyzability_score,
+    "analyzability_details": result.analyzability_details,
+    # Meta verdict (from overall_risk_assessment)
+    "meta_verdict": meta_result.overall_risk_assessment.get("skill_verdict") if meta_result else None,
+    "meta_risk_level": meta_result.overall_risk_assessment.get("risk_level") if meta_result else None,
+    "meta_summary": meta_result.overall_risk_assessment.get("summary") if meta_result else None,
+    "meta_top_priority": meta_result.overall_risk_assessment.get("top_priority") if meta_result else None,
+    "meta_correlations": meta_result.correlations if meta_result else None,
+    "meta_recommendations": meta_result.recommendations if meta_result else None,
+    "meta_false_positive_count": len(meta_result.false_positives) if meta_result else None,
+    # Blobs
+    "full_report": result.to_dict(),
+    "meta_analysis": meta_result.to_dict() if meta_result else None,
+    "scan_metadata": result.scan_metadata,
+}
 
-### Tables (created fresh — no relation to PR #191 migrations)
-
-**`scan_reports`** — one row per scan execution:
-
-```sql
-CREATE TABLE IF NOT EXISTS scan_reports (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    version_id      UUID REFERENCES skill_versions(id) ON DELETE CASCADE,
-    org_slug        TEXT NOT NULL,
-    skill_name      TEXT NOT NULL,
-    semver          TEXT NOT NULL,
-
-    -- Scanner verdict
-    is_safe         BOOLEAN NOT NULL,
-    max_severity    TEXT NOT NULL,       -- CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE
-    findings_count  INTEGER NOT NULL DEFAULT 0,
-
-    -- Analyzer metadata
-    analyzers_used  TEXT[] NOT NULL DEFAULT '{}',
-    analyzers_failed JSONB DEFAULT '[]',
-    analyzability_score REAL,
-
-    -- Scan config
-    scanner_version TEXT,
-    scanner_model   TEXT,               -- e.g. "gemini/gemini-3.1-flash-lite-preview"
-    policy_name     TEXT,               -- e.g. "balanced"
-    scan_duration_ms INTEGER,
-
-    -- Full blobs
-    full_report     JSONB,              -- ScanResult.to_dict()
-    meta_analysis   JSONB,              -- MetaAnalysisResult.to_dict() if meta ran
-
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+# scan_findings rows (one per finding)
+for i, f in enumerate(result.findings):
+    {
+        "rule_id": f.rule_id,
+        "category": f.category.value,
+        "severity": f.severity.value,
+        "title": f.title,
+        "description": f.description,
+        "file_path": f.file_path,
+        "line_number": f.line_number,
+        "snippet": f.snippet,
+        "remediation": f.remediation,
+        "analyzer": f.analyzer,
+        "is_false_positive": f.metadata.get("meta_false_positive"),
+        "meta_confidence": f.metadata.get("meta_confidence"),
+        "meta_priority": f.metadata.get("meta_priority"),
+        "metadata": f.metadata,
+    }
 ```
-
-Note what's **not** here compared to PR #191: no `grade` column, no `policy_fingerprint`. The scanner doesn't produce letter grades — that's a gauntlet concept. We store the scanner's native output (`max_severity`, `is_safe`) and let the UI present it directly. If we later want to derive a letter grade, we can compute it at display time.
-
-**`scan_findings`** — denormalized findings for querying:
-
-```sql
-CREATE TABLE IF NOT EXISTS scan_findings (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    report_id   UUID NOT NULL REFERENCES scan_reports(id) ON DELETE CASCADE,
-    rule_id     TEXT NOT NULL,
-    category    TEXT NOT NULL,           -- ThreatCategory enum value
-    severity    TEXT NOT NULL,           -- Severity enum value
-    title       TEXT NOT NULL,
-    description TEXT,
-    file_path   TEXT,
-    line_number INTEGER,
-    snippet     TEXT,
-    remediation TEXT,
-    analyzer    TEXT,                    -- which analyzer produced this
-    metadata    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-
-Both tables get RLS enabled, standard indexes on `version_id` / `report_id` / `severity`, and the `set_updated_at` trigger on `scan_reports`.
-
-### What We Don't Need
-
-- **No `grade` column** — the scanner speaks in severities, not letter grades
-- **No `policy_fingerprint`** — the policy name is sufficient for traceability
-- **No separate `BridgeScanResult` dataclass** — we can work directly with the scanner's `ScanResult` and store `result.to_dict()` as the `full_report` blob. The bridge maps to the DB insert, not to an intermediate representation
-- **No `_scan_result_to_audit_fields` cross-module import** — the bridge writes directly to `scan_reports`
 
 ---
 
 ## Incremental Testing Plan
 
-### Why the Old Backfill Parameters Need Revisiting
+### Step 0: Unit Tests (No API Keys Required)
 
-The PR #191 backfill used `--limit 100 --workers 20`. That was with scanner 1.0.2 which ran 4 analyzers (static, behavioral, trigger, LLM). With 2.0.3 we're running 5 core analyzers + LLM + meta-analysis — roughly double the work per skill, with two LLM calls instead of one.
+Test the bridge module with mocked scanner output:
+- Result mapping (ScanResult → DB insert dict)
+- Finding mapping (Finding → scan_findings row)
+- Error handling (scanner crash → fail-open, no publish block)
+- Meta-analysis mapping (MetaAnalysisResult → denormalized fields)
+- LLM degradation detection via `analyzers_failed`
 
-The old approach also had `_capture_stdout_during()` which was not thread-safe. That's gone now, but the LLM calls themselves share a rate limit on the Gemini API. Too many concurrent workers will hit rate limits and cause retries.
+### Step 1: Smoke Test (1 Skill, Static-Only)
 
-### Recommended Testing Sequence
-
-**Step 0: Smoke test (1 skill, no LLM)**
-
-Before any bulk run, verify the bridge works end-to-end with a single skill and only free analyzers (no Gemini calls):
+Deploy to dev with `enable_cisco_scanner=True` but using only free analyzers (no LLM). Verify:
+- Scanner dependency installs correctly in Modal container
+- Bridge imports, loads rules/packs, runs static + bytecode + pipeline + behavioral + trigger
+- Result stores correctly in `scan_reports` + `scan_findings`
+- API endpoint returns the report
+- Frontend renders it (if SHOW_SCANNER_REPORT enabled)
 
 ```bash
 cd server && DHUB_ENV=dev uv run --package decision-hub-server \
-    python -c "
-from decision_hub.domain.skill_scanner_bridge import scan_skill_zip
-from decision_hub.settings import create_settings
-settings = create_settings()
-settings.enable_cisco_scanner = True
-# Test with a known skill zip from S3...
-"
+    python -m decision_hub.scripts.backfill_scan_reports --limit 1 --workers 1 --no-llm
 ```
 
-This validates: dependency installs correctly, bridge imports work, scanner loads rules/packs, result mapping is correct.
+### Step 2: Single Skill, Full Pipeline
 
-**Step 1: Single skill with full LLM pipeline**
-
-Run one skill through the complete pipeline (all analyzers + meta-analysis) to verify Gemini integration:
+One skill through the complete pipeline (all analyzers + meta-analysis):
 
 ```bash
 cd server && DHUB_ENV=dev uv run --package decision-hub-server \
     python -m decision_hub.scripts.backfill_scan_reports --limit 1 --workers 1
 ```
 
-Check: scan completes, findings are reasonable, meta-analysis runs, report stores correctly, no errors in logs.
+Verify: LLM analyzer runs, meta-analysis runs, `meta_verdict` is populated, findings have `meta_false_positive` enrichment, scan duration is reasonable (~30-60s).
 
-**Step 2: Small batch (10 skills, 2 workers)**
+### Step 3: Small Batch (10 Skills, 2 Workers)
 
 ```bash
 cd server && DHUB_ENV=dev uv run --package decision-hub-server \
     python -m decision_hub.scripts.backfill_scan_reports --limit 10 --workers 2
 ```
 
-Check: no rate limit errors, no thread-safety issues, scan times are reasonable (expect 30-60s per skill with LLM), grade distribution looks sane.
+Verify: no Gemini rate limits, no thread-safety issues, results look reasonable.
 
-**Step 3: Medium batch (100 skills, 4 workers)**
+### Step 4: Scale Test (100 Skills, 4 Workers)
 
 ```bash
 cd server && DHUB_ENV=dev uv run --package decision-hub-server \
     python -m decision_hub.scripts.backfill_scan_reports --limit 100 --workers 4
 ```
 
-This is where we validate at scale. Key metrics to check:
-- **Severity distribution**: what % of skills get CRITICAL/HIGH findings?
-- **Comparison with gauntlet**: how often do scanner and gauntlet agree on "problematic" vs "clean"?
-- **LLM reliability**: how many scans had `analyzers_failed` entries for `llm_analyzer`?
-- **Scan duration**: median/p90/p99 per skill
-- **Gemini rate limits**: any 429 errors in logs?
+At 4 workers, each skill makes ~2 Gemini calls (LLM + meta), so ~8 concurrent requests. Expected scan rate: ~2-3 skills/minute with LLM.
 
-At 4 workers with 2 LLM calls each (LLM analyzer + meta), that's ~8 concurrent Gemini requests. With gemini-3.1-flash-lite-preview, this should be well within rate limits. If we see 429s, reduce to 2 workers.
+Key metrics to analyze:
+- **Meta verdict distribution**: % SAFE / SUSPICIOUS / MALICIOUS
+- **Max severity distribution**: % CRITICAL / HIGH / MEDIUM / LOW / INFO / SAFE
+- **FP filtering rate**: what % of findings does meta mark as FP?
+- **Agreement with gauntlet**: compare scanner verdicts to gauntlet grades
+- **LLM reliability**: any `LLM_ANALYSIS_FAILED` findings or `analyzers_failed` entries?
+- **Scan duration**: median / p90
 
-**Step 4: Full catalog**
+### Step 5: Full Catalog
 
 ```bash
 cd server && DHUB_ENV=dev uv run --package decision-hub-server \
     python -m decision_hub.scripts.backfill_scan_reports --workers 4 --resume
 ```
 
-The `--resume` flag skips skills that already have a scan report (LEFT JOIN IS NULL pattern). This makes the backfill restartable after crashes or interruptions.
-
-### Backfill Script Design
-
-The new backfill follows the same pattern as the old one (from PR #191) but simplified:
-
-1. Query skills whose latest version has no `scan_report` row
-2. Download zip from S3
-3. Run scanner (in worker thread)
-4. Insert `scan_report` + `scan_findings` rows (in main thread, batched)
-5. Circuit breaker on N consecutive errors
-
-Key differences from the old backfill:
-- No `_capture_stdout_during` — thread-safe by default
-- Uses `build_analyzers()` factory — not manual analyzer construction
-- Stores `result.to_dict()` directly as `full_report` — no intermediate mapping
-- `--delay` parameter for throttling Gemini requests if needed
-
----
-
-## UI Presentation
-
-### Design Philosophy
-
-The gauntlet and scanner serve different purposes and speak different languages. The gauntlet produces a letter grade (A/B/C/F) based on specific checks (manifest validation, credential scanning, prompt injection, etc.). The scanner produces a severity verdict (CRITICAL/HIGH/MEDIUM/LOW/INFO/SAFE) based on structured findings from multiple analyzers.
-
-Rather than trying to unify them into one view, we present each in its native format:
-
-- **Gauntlet**: letter grade badge + check results grid (existing UI, unchanged)
-- **Scanner**: severity-based findings view (new section on the Audit tab)
-
-### Audit Tab Layout (Revised)
-
-Currently the Audit tab shows a flat list of `AuditLogEntry` cards. Each card has a grade badge, version, publisher, date, and a "Safety Checks" grid.
-
-The revised layout adds a "Scanner Report" section below each audit entry, gated behind a feature flag:
-
-```
-┌─────────────────────────────────────────────────────┐
-│  Audit Log                                          │
-│                                                     │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ ● A  v1.2.3  by user  2026-03-13             │  │
-│  │                                               │  │
-│  │ Safety Checks (gauntlet — existing)           │  │
-│  │ ┌──────────┐ ┌──────────┐ ┌──────────┐       │  │
-│  │ │ ✓ Manifest│ │ ✓ Safety │ │ ✓ Prompt │       │  │
-│  │ │  schema  │ │   scan   │ │  safety  │       │  │
-│  │ └──────────┘ └──────────┘ └──────────┘       │  │
-│  │                                               │  │
-│  │ Scanner Report (new — when available)         │  │
-│  │ ┌─────────────────────────────────────────┐   │  │
-│  │ │ Verdict: SAFE  │ 3 findings │ 94% score │   │  │
-│  │ ├─────────────────────────────────────────┤   │  │
-│  │ │ ▸ MEDIUM  Overly broad description      │   │  │
-│  │ │   static_analyzer · prompt_injection     │   │  │
-│  │ │                                          │   │  │
-│  │ │ ▸ LOW  Undeclared network capability     │   │  │
-│  │ │   behavioral · unauthorized_tool_use     │   │  │
-│  │ │                                          │   │  │
-│  │ │ ▸ INFO  LLM context budget exceeded      │   │  │
-│  │ │   meta_analyzer · policy_violation       │   │  │
-│  │ ├─────────────────────────────────────────┤   │  │
-│  │ │ Analyzers: static, behavioral, pipeline, │   │  │
-│  │ │ bytecode, trigger, llm, meta             │   │  │
-│  │ │ Policy: balanced │ Duration: 34s         │   │  │
-│  │ │ Scanner v2.0.3 │ Model: gemini/3.1-...  │   │  │
-│  │ └─────────────────────────────────────────┘   │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-```
-
-### Scanner Report Component
-
-The scanner report section shows:
-
-1. **Summary bar**: max severity badge (color-coded), finding count, analyzability score (as a percentage bar or number)
-2. **Findings list**: expandable, sorted by severity. Each finding shows:
-   - Severity badge (CRITICAL=red, HIGH=orange, MEDIUM=yellow, LOW=blue, INFO=gray)
-   - Title
-   - Analyzer name + threat category (as small labels)
-   - Expandable: description, file path + line number, code snippet, remediation
-3. **Metadata footer**: analyzers used, policy name, scan duration, scanner version, model
-
-### Severity Color Mapping
-
-Use the existing severity color pattern from `CheckResultsGrid` but adapted for the scanner's 6-level scale:
-
-| Severity | Color | CSS variable |
-|----------|-------|-------------|
-| CRITICAL | Red (`#ff4757`) | `severityCritical` |
-| HIGH | Orange (`#ff6b35`) | `severityHigh` |
-| MEDIUM | Yellow (`#ffa502`) | `severityMedium` |
-| LOW | Blue (`#3742fa`) | `severityLow` |
-| INFO | Gray (`#747d8c`) | `severityInfo` |
-| SAFE | Green (`#2ed573`) | `severitySafe` |
-
-### Feature Flag
-
-```typescript
-// frontend/src/featureFlags.ts
-export const SHOW_SCANNER_REPORT = false;
-```
-
-The scanner report section is only rendered when `SHOW_SCANNER_REPORT` is `true` AND the API returns scan data for the version. This means:
-- Production: off until we're confident
-- Dev: enable when ready to test
-
-### TypeScript Types
-
-```typescript
-// frontend/src/types/api.ts
-
-export interface ScanFinding {
-  rule_id: string;
-  category: string;
-  severity: string;
-  title: string;
-  description: string | null;
-  file_path: string | null;
-  line_number: number | null;
-  snippet: string | null;
-  remediation: string | null;
-  analyzer: string | null;
-  metadata: Record<string, unknown>;
-}
-
-export interface ScanReport {
-  id: string;
-  version_id: string | null;
-  is_safe: boolean;
-  max_severity: string;
-  findings_count: number;
-  findings: ScanFinding[];
-  analyzers_used: string[];
-  analyzers_failed: { analyzer: string; error: string }[];
-  analyzability_score: number | null;
-  scanner_version: string | null;
-  scanner_model: string | null;
-  policy_name: string | null;
-  scan_duration_ms: number | null;
-  created_at: string;
-}
-```
-
-### API Endpoint
-
-```
-GET /v1/skills/{org}/{skill}/scan-report?version={semver}
-```
-
-Returns the latest `ScanReport` for the given version, with findings included inline (no separate findings endpoint needed — findings are part of the report). The `full_report` JSONB blob is NOT returned by default (it's large); a separate endpoint can serve it if needed.
-
----
-
-## Implementation Phases
-
-### Phase 1: Foundation (~200 lines)
-
-**One PR. No behavioral changes.**
-
-- [ ] Feature flag: `enable_cisco_scanner: bool = False` and `cisco_scanner_policy: str = "balanced"` in `settings.py`
-- [ ] SQL migration: `scan_reports` + `scan_findings` tables (created fresh)
-- [ ] SQLAlchemy table definitions in `database.py`
-- [ ] DB helper functions: `insert_scan_report()`, `insert_scan_findings()`, `find_scan_report_for_version()`
-- [ ] Pydantic models in `models.py`
-- [ ] `cisco-ai-skill-scanner>=2.0.0` dependency in `server/pyproject.toml`
-
-### Phase 2: Bridge + Pipeline Integration (~300 lines)
-
-**One PR. Scanner runs in parallel but results are only logged, not stored yet if you want to split further — but storing is simple enough to include.**
-
-- [ ] `server/src/decision_hub/domain/skill_scanner_bridge.py` — clean implementation using `build_analyzers()` factory and `ScanPolicy.from_preset()`
-- [ ] Hook into `execute_publish()` in `publish_pipeline.py`: run scanner after gauntlet, store result, never affect the publish decision
-- [ ] Backfill script: `server/src/decision_hub/scripts/backfill_scan_reports.py`
-- [ ] Makefile target: `backfill-scan-reports`
-- [ ] Tests: bridge unit tests (result mapping, error handling, LLM degradation detection via `analyzers_failed`)
-
-### Phase 3: API + Frontend (~400 lines)
-
-**One PR. Purely additive UI.**
-
-- [ ] `GET /v1/skills/{org}/{skill}/scan-report` endpoint with rate limiting
-- [ ] Frontend feature flag: `SHOW_SCANNER_REPORT` in `featureFlags.ts`
-- [ ] `ScannerReport` component on the Audit tab
-- [ ] TypeScript types for `ScanReport` / `ScanFinding`
-- [ ] Responsive styles following mobile-first pattern
-
-### Phase 4: arXiv Benchmark Suite
-
-**One PR. Independent of Phases 1-3.**
-
-- [ ] Cherry-pick test cases from PR #194 branch (`cursor/arxiv-test-set-gauntlet-eb6f`)
-- [ ] Adapt to run against both gauntlet and scanner
-- [ ] `make benchmark-arxiv` target (not in CI)
-
-### Phase 5: Backfill + Analysis (Operational)
-
-**Not a PR — operational work after Phase 2 is deployed to dev.**
-
-- [ ] Step 0-4 testing sequence as described above
-- [ ] Full catalog backfill
-- [ ] Write up comparison analysis: scanner vs gauntlet agreement, false positive rates, new findings caught
-
 ---
 
 ## What We're Deliberately NOT Doing
 
-These are conscious decisions to keep the scope manageable:
-
-1. **No letter grade for scanner** — the scanner speaks in severities. A grade mapping can be added later if wanted, but it's not the scanner's native language.
-2. **No `BridgeScanResult` intermediate dataclass** — the scanner's `ScanResult.to_dict()` is the canonical format. The bridge maps directly from scanner output to DB insert.
-3. **No gauntlet removal** — the gauntlet is the decision-maker. Period.
-4. **No `eval_audit_logs` changes** — the existing audit log stays as-is. Scan reports are a parallel data stream.
-5. **No scanner grade in version resolution** — `resolve_version` still uses `eval_status` (gauntlet grade). Scanner data is display-only.
-6. **No stdout capture** — the scanner's structured error reporting (`analyzers_failed`, `LLM_ANALYSIS_FAILED` findings) replaces the old hack.
-7. **No monkey patches** — all upstream issues are fixed in 2.0.0+.
-8. **No cross-skill scanning** — the scanner supports multi-skill batch scanning with cross-skill findings, but we scan one skill at a time (matching the publish pipeline's granularity).
-
----
-
-## Risk Mitigation
-
-| Risk | Mitigation |
-|------|-----------|
-| Scanner adds latency to publish | Wrapped in try/except; failure = warning log + no scan data stored. Consider running async/in background if latency is a problem. |
-| Scanner dependency bloats container | Monitor Modal image size. Scanner is mostly pure Python; YARA rules are small. Magika model (~1MB) is the largest addition. |
-| Gemini rate limits from double LLM usage | Scanner + gauntlet both call Gemini. Monitor 429 rates. If problematic, scanner can use a different model or skip LLM. |
-| False positive rate still too high | Policy engine is the escape valve. Switch to `permissive` preset or create a custom policy YAML. |
-| Scanner API breaks in future versions | Pin `>=2.0.0,<3.0.0`. The bridge uses only the public API (`SkillScanner`, `build_analyzers`, `ScanPolicy`, `MetaAnalyzer`). |
+1. **No gauntlet changes** — it stays as-is, including `eval_audit_logs`
+2. **No scanner-based publish decisions** — scanner data is display-only
+3. **No letter grade for scanner** — we show meta_verdict and severity natively
+4. **No monkey patches** — all upstream bugs are fixed in 2.0.0+
+5. **No stdout capture** — `analyzers_failed` + `LLM_ANALYSIS_FAILED` findings replace the old hack
+6. **No multi-PR phasing** — this is one PR since the partial states aren't useful on their own
+7. **No custom policy** — start with stock `balanced`, customize after data
