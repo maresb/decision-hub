@@ -757,9 +757,10 @@ def execute_publish(
             version,
             version_record.id,
         )
-        delete_audit_logs_by_version_id(conn, version_record.id)
-        delete_version(conn, skill.id, version)
-        conn.commit()
+        with conn.engine.connect() as rollback_conn:
+            delete_audit_logs_by_version_id(rollback_conn, version_record.id)
+            delete_version(rollback_conn, skill.id, version)
+            rollback_conn.commit()
         raise
 
     # 11b. Store Cisco scan report (non-critical, fail-open)
@@ -819,21 +820,29 @@ def _try_store_scan_result(
     skill_name: str,
     version: str,
 ) -> None:
-    """Store a Cisco scan result if available. Never raises."""
+    """Store a Cisco scan result if available. Never raises.
+
+    Uses a fresh connection because the caller's connection may be inside
+    an ``engine.begin()`` block that has already been committed (the
+    FastAPI ``get_connection`` dependency).  After an explicit
+    ``conn.commit()`` inside ``engine.begin()``, SQLAlchemy rejects
+    further operations on that connection.
+    """
     if scan_data is None:
         return
     try:
         from decision_hub.domain.skill_scanner_bridge import store_scan_result
 
-        store_scan_result(
-            conn,
-            scan_data,
-            version_id=version_id,
-            org_slug=org_slug,
-            skill_name=skill_name,
-            semver=version,
-        )
-        conn.commit()
+        with conn.engine.connect() as fresh_conn:
+            store_scan_result(
+                fresh_conn,
+                scan_data,
+                version_id=version_id,
+                org_slug=org_slug,
+                skill_name=skill_name,
+                semver=version,
+            )
+            fresh_conn.commit()
     except Exception:
         logger.opt(exception=True).warning(
             "Failed to store scan report for {}/{} — scan data lost but publish succeeded",
