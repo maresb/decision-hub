@@ -1405,7 +1405,7 @@ class TestListSkills:
 class TestGetLatestVersion:
     """GET /v1/skills/{org}/{skill}/latest-version -- returns the latest published version."""
 
-    @patch("decision_hub.api.registry_routes.resolve_version")
+    @patch("decision_hub.api.registry_routes.resolve_latest_version")
     def test_latest_version_success(
         self,
         mock_resolve: MagicMock,
@@ -1422,10 +1422,8 @@ class TestGetLatestVersion:
         assert resp.status_code == 200
         assert resp.json()["version"] == "2.3.1"
         assert resp.json()["checksum"] == "abc123def456"
-        mock_resolve.assert_called_once()
-        assert mock_resolve.call_args[1]["allow_risky"] is False
 
-    @patch("decision_hub.api.registry_routes.resolve_version")
+    @patch("decision_hub.api.registry_routes.resolve_latest_version")
     def test_latest_version_not_found(
         self,
         mock_resolve: MagicMock,
@@ -1439,7 +1437,7 @@ class TestGetLatestVersion:
         assert resp.status_code == 404
         assert "No versions found" in resp.json()["detail"]
 
-    @patch("decision_hub.api.registry_routes.resolve_version")
+    @patch("decision_hub.api.registry_routes.resolve_latest_version")
     def test_latest_version_does_not_require_auth(
         self,
         mock_resolve: MagicMock,
@@ -1455,7 +1453,7 @@ class TestGetLatestVersion:
         assert resp.status_code == 200
 
     @patch("decision_hub.api.registry_routes.list_user_org_ids")
-    @patch("decision_hub.api.registry_routes.resolve_version")
+    @patch("decision_hub.api.registry_routes.resolve_latest_version")
     def test_latest_version_passes_user_org_ids_when_authenticated(
         self,
         mock_resolve: MagicMock,
@@ -1477,7 +1475,7 @@ class TestGetLatestVersion:
         mock_resolve.assert_called_once()
         assert mock_resolve.call_args.kwargs["user_org_ids"] == [org.id]
 
-    @patch("decision_hub.api.registry_routes.resolve_version")
+    @patch("decision_hub.api.registry_routes.resolve_latest_version")
     def test_latest_version_unauthenticated_passes_none_org_ids(
         self,
         mock_resolve: MagicMock,
@@ -1491,23 +1489,6 @@ class TestGetLatestVersion:
         assert resp.status_code == 404
         mock_resolve.assert_called_once()
         assert mock_resolve.call_args.kwargs["user_org_ids"] is None
-
-    @patch("decision_hub.api.registry_routes.resolve_version")
-    def test_latest_version_allow_risky(
-        self,
-        mock_resolve: MagicMock,
-        client: TestClient,
-    ) -> None:
-        """allow_risky=true is forwarded to resolve_version."""
-        org = _make_org()
-        skill = _make_skill(org)
-        mock_resolve.return_value = _make_version(skill)
-
-        resp = client.get("/v1/skills/test-org/my-skill/latest-version?allow_risky=true")
-
-        assert resp.status_code == 200
-        mock_resolve.assert_called_once()
-        assert mock_resolve.call_args[1]["allow_risky"] is True
 
 
 # ---------------------------------------------------------------------------
