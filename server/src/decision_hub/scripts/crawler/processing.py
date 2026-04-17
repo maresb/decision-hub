@@ -22,6 +22,7 @@ import sqlalchemy.exc
 from loguru import logger
 
 from decision_hub.domain.orgs import METADATA_CACHE_TTL
+from decision_hub.models import VersionEvalStatus
 from decision_hub.domain.publish import (
     build_quarantine_s3_key,
     build_s3_key,
@@ -384,7 +385,7 @@ def _publish_one_skill(
             unscanned_files=prep.unscanned_files,
         )
         gauntlet_passed = report.passed
-        eval_status = report.grade
+        eval_status: VersionEvalStatus = report.grade
         gauntlet_summary = report.gauntlet_summary
     else:
         check_results = []
