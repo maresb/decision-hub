@@ -365,7 +365,8 @@ class TestPublishOneSkillReturnsStatus:
         mock_skill_deps["run_gauntlet_pipeline"].assert_not_called()
         mock_skill_deps["insert_version"].assert_called_once()
         call_kwargs = mock_skill_deps["insert_version"].call_args
-        assert call_kwargs.kwargs.get("eval_status") or call_kwargs[1].get("eval_status") == "pending"
+        actual = call_kwargs.kwargs.get("eval_status") or call_kwargs[1].get("eval_status")
+        assert actual == "pending"
 
 
 # ---------------------------------------------------------------------------
