@@ -1526,9 +1526,14 @@ def _update_single_skill(skill_ref: str) -> None:
     base_url = get_api_url()
 
     with httpx.Client(timeout=60) as client:
-        # Quick version check via /latest-version (does NOT inflate download count)
+        # Quick version check via /latest-version (does NOT inflate download count).
+        # Pass allow_risky so it uses the same grade filter as /resolve.
+        latest_params: dict[str, str] = {}
+        if allow_risky:
+            latest_params["allow_risky"] = "true"
         resp = client.get(
             f"{base_url}/v1/skills/{org_slug}/{skill_name}/latest-version",
+            params=latest_params,
             headers=headers,
         )
         if resp.status_code == 404:
@@ -1587,10 +1592,15 @@ def _update_all_skills() -> None:
             installed_version = installed.version if installed else None
             allow_risky = installed.allow_risky if installed else False
 
-            # Quick version check via /latest-version (does NOT inflate download count)
+            # Quick version check via /latest-version (does NOT inflate download count).
+            # Pass allow_risky so it uses the same grade filter as /resolve.
             try:
+                latest_params: dict[str, str] = {}
+                if allow_risky:
+                    latest_params["allow_risky"] = "true"
                 resp = client.get(
                     f"{base_url}/v1/skills/{org_slug}/{skill_name}/latest-version",
+                    params=latest_params,
                     headers=headers,
                 )
                 if resp.status_code == 404:

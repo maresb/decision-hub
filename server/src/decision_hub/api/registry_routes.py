@@ -722,12 +722,20 @@ def get_similar_skills(
 def get_latest_version(
     org_slug: str,
     skill_name: str,
+    allow_risky: bool = Query(False),
     conn: Connection = Depends(get_connection),
     current_user: User | None = Depends(get_current_user_optional),
 ) -> LatestVersionResponse:
-    """Return the latest published version of a skill."""
+    """Return the latest published version of a skill.
+
+    Uses the same grade filter as /resolve so the CLI never advertises
+    a version that /resolve would reject.
+    """
     user_org_ids = list_user_org_ids(conn, current_user.id) if current_user else None
-    version = resolve_latest_version(conn, org_slug, skill_name, user_org_ids=user_org_ids)
+    version = resolve_version(
+        conn, org_slug, skill_name, "latest",
+        allow_risky=allow_risky, user_org_ids=user_org_ids,
+    )
     if version is None:
         raise HTTPException(
             status_code=404,
